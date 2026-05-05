@@ -1,0 +1,377 @@
+"""
+Dashboard statistics and analytics endpoints.
+"""
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, and_
+from datetime import datetime, timedelta
+
+from app.database import get_db
+from app.models.video import Video, ProcessingStatus
+from app.models.individual import TrackedIndividual
+from app.models.violation import Violation
+from app.schemas.dashboard import (
+    DashboardStats, RepeatOffendersResponse, RepeatOffender, RecentEvent
+)
+
+router = APIRouter()
+
+
+@router.get("/stats", response_model=DashboardStats)
+async def get_dashboard_stats(
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get comprehensive dashboard statistics with analytics.
+    
+    Returns:
+    - Total counts and compliance rates
+    - PPE-wise violation breakdown
+    - Shift-based analysis
+    - Confidence metrics
+    - Daily trends
+    - Recent events feed
+    """
+    # Total videos
+    videos_result = await db.execute(select(func.count()).select_from(Video))
+    total_videos = videos_result.scalar() or 0
+    
+    # Processing videos
+    processing_result = await db.execute(
+        select(func.count()).select_from(Video)
+        .where(Video.status == ProcessingStatus.PROCESSING.value)
+    )
+    videos_processing = processing_result.scalar() or 0
+    
+    # Total individuals
+    individuals_result = await db.execute(
+        select(func.count()).select_from(TrackedIndividual)
+    )
+    total_individuals = individuals_result.scalar() or 0
+    
+    # Individuals with at least one CONFIRMED violation in a REVIEWED video
+    violators_result = await db.execute(
+        select(func.count()).select_from(TrackedIndividual)
+        .join(Video, TrackedIndividual.video_id == Video.id)
+        .where(TrackedIndividual.confirmed_violations > 0)
+        .where(Video.is_reviewed == 1)
+    )
+    total_violators = violators_result.scalar() or 0
+    
+    # Compliance rates
+    compliance_rate = ((total_individuals - total_violators) / total_individuals * 100) if total_individuals > 0 else 100.0
+    violation_rate = (total_violators / total_individuals * 100) if total_individuals > 0 else 0.0
+    
+    # Total violations (CONFIRMED in REVIEWED videos)
+    violations_result = await db.execute(
+        select(func.count()).select_from(Violation)
+        .join(TrackedIndividual, Violation.individual_id == TrackedIndividual.id)
+        .join(Video, TrackedIndividual.video_id == Video.id)
+        .where(Violation.review_status == 'confirmed')
+        .where(Video.is_reviewed == 1)
+    )
+    total_violations = violations_result.scalar() or 0
+    
+    # Confirmed violations
+    confirmed_result = await db.execute(
+        select(func.count()).select_from(Violation)
+        .where(Violation.review_status == 'confirmed')
+    )
+    confirmed_violations = confirmed_result.scalar() or 0
+    
+    # Rejected violations
+    rejected_result = await db.execute(
+        select(func.count()).select_from(Violation)
+        .where(Violation.review_status == 'rejected')
+    )
+    rejected_violations = rejected_result.scalar() or 0
+    
+    # Pending violations
+    pending_violations = total_violations - confirmed_violations - rejected_violations
+    
+    # Repeat offenders (2+ CONFIRMED violations in REVIEWED videos)
+    repeat_result = await db.execute(
+        select(func.count()).select_from(TrackedIndividual)
+        .join(Video, TrackedIndividual.video_id == Video.id)
+        .where(TrackedIndividual.confirmed_violations >= 2)
+        .where(Video.is_reviewed == 1)
+    )
+    repeat_offenders_count = repeat_result.scalar() or 0
+    
+    # Violations by type (PPE-wise) - Verified Videos Only
+    type_result = await db.execute(
+        select(Violation.violation_type, func.count())
+        .join(TrackedIndividual, Violation.individual_id == TrackedIndividual.id)
+        .join(Video, TrackedIndividual.video_id == Video.id)
+        .where(Video.is_reviewed == 1)
+        .where(Violation.review_status == 'confirmed')
+        .group_by(Violation.violation_type)
+    )
+    violations_by_type = {row[0]: row[1] for row in type_result.all()}
+    
+    # Violations by shift - Verified Videos Only
+    shift_result = await db.execute(
+        select(Video.shift, func.count(Violation.id))
+        .join(TrackedIndividual, TrackedIndividual.video_id == Video.id)
+        .join(Violation, Violation.individual_id == TrackedIndividual.id)
+        .where(Video.shift.isnot(None))
+        .where(Video.is_reviewed == 1)
+        .where(Violation.review_status == 'confirmed')
+        .group_by(Video.shift)
+    )
+    violations_by_shift = {row[0]: row[1] for row in shift_result.all()}
+    
+    confidence_result = await db.execute(
+        select(func.avg(Violation.confidence))
+        .join(TrackedIndividual, Violation.individual_id == TrackedIndividual.id)
+        .join(Video, TrackedIndividual.video_id == Video.id)
+        .where(Violation.review_status == 'confirmed')
+        .where(Video.is_reviewed == 1)
+    )
+    avg_confidence = confidence_result.scalar() or 0.0
+    
+    low_conf_result = await db.execute(
+        select(func.count()).select_from(Violation)
+        .join(TrackedIndividual, Violation.individual_id == TrackedIndividual.id)
+        .join(Video, TrackedIndividual.video_id == Video.id)
+        .where(and_(
+            Violation.confidence < 0.5,
+            Violation.review_status == 'confirmed',
+            Video.is_reviewed == 1
+        ))
+    )
+    low_confidence_count = low_conf_result.scalar() or 0
+    
+    # Recent videos (last 24 hours) - use local time
+    yesterday = datetime.now() - timedelta(days=1)
+    recent_result = await db.execute(
+        select(func.count()).select_from(Video)
+        .where(Video.uploaded_at >= yesterday)
+    )
+    recent_videos_count = recent_result.scalar() or 0
+    
+    # Daily trends (last 7 days) - use local time for proper date sync
+    daily_violations = []
+    for i in range(6, -1, -1):
+        day = datetime.now().date() - timedelta(days=i)
+        day_start = datetime.combine(day, datetime.min.time())
+        day_end = day_start + timedelta(days=1)
+        
+        day_result = await db.execute(
+            select(func.count()).select_from(Violation)
+            .join(TrackedIndividual, Violation.individual_id == TrackedIndividual.id)
+            .join(Video, TrackedIndividual.video_id == Video.id)
+            .where(and_(Violation.detected_at >= day_start, Violation.detected_at < day_end))
+            .where(Violation.review_status == 'confirmed')
+            .where(Video.is_reviewed == 1)
+        )
+        count = day_result.scalar() or 0
+        # Include day name for frontend display
+        day_name = day.strftime("%a")  # Mon, Tue, Wed, etc.
+        daily_violations.append({"date": day.strftime("%Y-%m-%d"), "day": day_name, "count": count})
+    
+    # Recent events feed (last 10)
+    events_result = await db.execute(
+        select(Violation, TrackedIndividual, Video)
+        .join(TrackedIndividual, Violation.individual_id == TrackedIndividual.id)
+        .join(Video, TrackedIndividual.video_id == Video.id)
+        .where(Violation.review_status == 'confirmed')
+        .order_by(Violation.detected_at.desc())
+        .limit(10)
+    )
+    recent_events = []
+    for violation, individual, video in events_result.all():
+        recent_events.append(RecentEvent(
+            id=violation.id,
+            person_id=individual.track_id,
+            video_name=video.original_filename,
+            violation_type=violation.violation_type,
+            confidence=violation.confidence,
+            detected_at=violation.detected_at,
+            image_path=violation.image_path
+        ))
+    
+    # Correlation Data (Violations vs People Count per Video)
+    correlation_data = []
+    recent_videos_result = await db.execute(
+        select(
+            Video.original_filename,
+            Video.total_individuals,
+            func.count(Violation.id).label("confirmed_count")
+        )
+        .outerjoin(TrackedIndividual, Video.id == TrackedIndividual.video_id)
+        .outerjoin(Violation, and_(
+            TrackedIndividual.id == Violation.individual_id, 
+            Violation.review_status == 'confirmed'
+        ))
+        .where(Video.is_reviewed == 1)
+        .group_by(Video.id)
+        .order_by(Video.uploaded_at.desc())
+        .limit(20)
+    )
+    
+    for row in recent_videos_result.all():
+        correlation_data.append({
+            "video_name": row[0],
+            "people_count": row[1],
+            "violation_count": row[2]
+        })
+    
+    # Real data only for correlation chart requested by user
+
+
+    # PPE Trends - real data from last 30 days (CONFIRMED ONLY)
+    ppe_trends = []
+    today = datetime.now().date()
+    
+    # Pre-populate map for efficiency
+    trend_map = {}
+    for i in range(29, -1, -1):
+        d = today - timedelta(days=i)
+        trend_map[d.strftime("%Y-%m-%d")] = {
+            "date": d.strftime("%Y-%m-%d"),
+            "Missing Helmet": 0,
+            "Missing Goggles": 0,
+            "Missing Shoes": 0,
+            "No Safety Vest": 0,
+            "No Face Mask": 0,
+            "No Gloves": 0,
+            "No Safety Boots": 0
+        }
+    
+    # Query confirmed violations for the period
+    thirty_days_ago = datetime.combine(today - timedelta(days=29), datetime.min.time())
+    trend_result = await db.execute(
+        select(func.date(Violation.detected_at), Violation.violation_type, func.count())
+        .where(Violation.detected_at >= thirty_days_ago)
+        .where(Violation.review_status == 'confirmed')
+        .group_by(func.date(Violation.detected_at), Violation.violation_type)
+    )
+    
+    for row_date, vtype, count in trend_result.all():
+        d_str = str(row_date)
+        if d_str in trend_map:
+            # Map database types to trend labels if necessary, or use directly
+            label = vtype
+            if "Helmet" in vtype: label = "Missing Helmet"
+            elif "Goggles" in vtype: label = "Missing Goggles"
+            elif "Boots" in vtype or "Shoes" in vtype: label = "Missing Shoes"
+            
+            trend_map[d_str][label] = count
+            
+    ppe_trends = list(trend_map.values())
+
+    return DashboardStats(
+        total_videos=total_videos,
+        total_individuals=total_individuals,
+        total_violations=total_violations,
+        confirmed_violations=confirmed_violations,
+        rejected_violations=rejected_violations,
+        pending_violations=pending_violations,
+        repeat_offenders_count=repeat_offenders_count,
+        videos_processing=videos_processing,
+        compliance_rate=round(compliance_rate, 1),
+        violation_rate=round(violation_rate, 1),
+        violations_by_type=violations_by_type,
+        violations_by_shift=violations_by_shift,
+        avg_detection_confidence=round(avg_confidence, 2),
+        low_confidence_count=low_confidence_count,
+        recent_videos_count=recent_videos_count,
+        daily_violations=daily_violations,
+        recent_events=recent_events,
+        correlation_data=correlation_data,
+        ppe_trends=ppe_trends
+    )
+
+
+@router.get("/repeat-offenders", response_model=RepeatOffendersResponse)
+async def get_repeat_offenders(
+    min_violations: int = 2,
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get individuals with multiple violations.
+    
+    Args:
+        min_violations: Minimum violation count (default: 2)
+        limit: Maximum results to return (default: 20)
+    """
+    result = await db.execute(
+        select(TrackedIndividual, Video.original_filename)
+        .join(Video, TrackedIndividual.video_id == Video.id)
+        .where(TrackedIndividual.confirmed_violations >= min_violations)
+        .where(Video.is_reviewed == 1)
+        .order_by(TrackedIndividual.confirmed_violations.desc())
+        .limit(limit)
+    )
+    rows = result.all()
+    
+    offenders = []
+    for ind, video_name in rows:
+        # Get most common violation type
+        type_result = await db.execute(
+            select(Violation.violation_type, func.count())
+            .where(Violation.individual_id == ind.id)
+            .group_by(Violation.violation_type)
+            .order_by(func.count().desc())
+            .limit(1)
+        )
+        type_row = type_result.first()
+        most_common = type_row[0] if type_row else None
+        
+        offenders.append(RepeatOffender(
+            individual_id=ind.id,
+            video_id=ind.video_id,
+            video_name=video_name,
+            track_id=ind.track_id,
+            total_violations=ind.total_violations,
+            confirmed_violations=ind.confirmed_violations,
+            most_common_violation=most_common,
+            risk_score=ind.risk_score
+        ))
+    
+    return RepeatOffendersResponse(
+        offenders=offenders,
+        total=len(offenders),
+        threshold=min_violations
+    )
+
+
+@router.get("/summary")
+async def get_quick_summary(
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get a quick summary for the dashboard header.
+    """
+    # Pending reviews
+    pending_result = await db.execute(
+        select(func.count()).select_from(Violation)
+        .where(Violation.review_status == 'pending')
+    )
+    pending_reviews = pending_result.scalar() or 0
+    
+    # High risk individuals
+    high_risk_result = await db.execute(
+        select(func.count()).select_from(TrackedIndividual)
+        .where(TrackedIndividual.risk_score >= 0.7)
+    )
+    high_risk_count = high_risk_result.scalar() or 0
+    
+    # Latest video
+    latest_result = await db.execute(
+        select(Video).order_by(Video.uploaded_at.desc()).limit(1)
+    )
+    latest_video = latest_result.scalar_one_or_none()
+    
+    return {
+        "pending_reviews": pending_reviews,
+        "high_risk_individuals": high_risk_count,
+        "latest_video": {
+            "id": latest_video.id,
+            "filename": latest_video.original_filename,
+            "status": latest_video.status
+        } if latest_video else None
+    }

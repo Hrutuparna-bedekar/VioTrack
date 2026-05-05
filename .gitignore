@@ -1,0 +1,41 @@
+# Node
+node_modules/
+frontend/node_modules/
+dist/
+build/
+.npm
+.eslintcache
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+*.egg-info/
+.pytest_cache/
+
+# Environment
+.env
+backend/.env
+
+# Database
+*.db
+*.sqlite3
+backend/violation_tracking.db
+
+# Project Specific
+backend/violation_images/
+backend/uploads/
+backend/snippets/
+backend/models/
+runs/
+*.pt
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

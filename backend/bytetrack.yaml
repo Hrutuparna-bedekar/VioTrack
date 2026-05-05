@@ -1,0 +1,23 @@
+# Ultralytics ByteTrack configuration
+# Must include ALL keys that ultralytics expects — missing keys cause AttributeError.
+# Reference: ultralytics/cfg/trackers/bytetrack.yaml
+
+tracker_type: bytetrack
+
+# High-confidence detection gate (first-stage association)
+track_high_thresh: 0.45
+
+# Low-confidence buffer gate (second-stage recovery)
+track_low_thresh: 0.1
+
+# Minimum score to initialise a new track
+new_track_thresh: 0.5
+
+# Frames to keep a lost track alive before pruning (~3s @ 30fps)
+track_buffer: 100
+
+# Hungarian algorithm cost threshold
+match_thresh: 0.8
+
+# Fuse detection confidence into IoU cost (REQUIRED — fixes AttributeError)
+fuse_score: true
